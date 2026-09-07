@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { gunzipSync, inflateSync } from 'node:zlib';
 
 const UPSTREAMS = [
   { name: 'OpenSubtitles v3', base: 'https://opensubtitles-v3.strem.io' },
@@ -166,6 +167,46 @@ function stableId(value) {
   return crypto.createHash('sha1').update(value).digest('hex').slice(0, 16);
 }
 
+function assTimeToVtt(value) {
+  const match = String(value || '').trim().match(/^(\d+):(\d{2}):(\d{2})[.](\d{1,2})$/);
+  if (!match) return null;
+
+  const hours = match[1].padStart(2, '0');
+  const minutes = match[2];
+  const seconds = match[3];
+  const millis = String(Number(match[4].padEnd(2, '0')) * 10).padStart(3, '0');
+
+  return hours + ':' + minutes + ':' + seconds + '.' + millis;
+}
+
+function parseAssSubtitles(source) {
+  const cues = [];
+
+  for (const line of source.split('\n')) {
+    if (!/^Dialogue\s*:/i.test(line)) continue;
+
+    const body = line.replace(/^Dialogue\s*:\s*/i, '');
+    const parts = body.split(',');
+    if (parts.length < 10) continue;
+
+    const start = assTimeToVtt(parts[1]);
+    const end = assTimeToVtt(parts[2]);
+    if (!start || !end) continue;
+
+    const cueText = parts
+      .slice(9)
+      .join(',')
+      .replace(/\\N/gi, '\n')
+      .replace(/\{\\[^}]+\}/g, '')
+      .trim();
+
+    if (!cueText) continue;
+    cues.push({ timing: start + ' --> ' + end, text: cueText });
+  }
+
+  return cues;
+}
+
 export function parseSubtitle(input) {
   const source = String(input || '')
     .replace(/^\uFEFF/, '')
@@ -191,7 +232,8 @@ export function parseSubtitle(input) {
     cues.push({ timing, text: cueText });
   }
 
-  return cues;
+  if (cues.length) return cues;
+  return parseAssSubtitles(source);
 }
 
 export function renderVtt(cues) {
@@ -298,6 +340,37 @@ async function translateBatch(items, targetName, apiKey) {
   }
 
   throw lastError;
+}
+
+function decodeSubtitleBytes(arrayBuffer, contentType = '', sourceUrl = '') {
+  let bytes = Buffer.from(arrayBuffer);
+  const loweredType = String(contentType || '').toLowerCase();
+  const loweredUrl = String(sourceUrl || '').toLowerCase();
+
+  const looksGzip =
+    (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) ||
+    loweredType.includes('gzip') ||
+    loweredUrl.endsWith('.gz');
+
+  if (looksGzip) {
+    try {
+      bytes = gunzipSync(bytes);
+    } catch {}
+  } else if (loweredType.includes('deflate')) {
+    try {
+      bytes = inflateSync(bytes);
+    } catch {}
+  }
+
+  if (bytes.length >= 2 && bytes[0] === 0xff && bytes[1] === 0xfe) {
+    return new TextDecoder('utf-16le').decode(bytes);
+  }
+
+  if (bytes.length >= 2 && bytes[0] === 0xfe && bytes[1] === 0xff) {
+    return new TextDecoder('utf-16be').decode(bytes);
+  }
+
+  return new TextDecoder('utf-8').decode(bytes);
 }
 
 async function translateSubtitle(sourceText, targetName, apiKey) {
@@ -666,8 +739,14 @@ export async function handleRequest(request) {
         throw new Error('Subtitle download returned ' + sourceResponse.status);
       }
 
+      const sourceText = decodeSubtitleBytes(
+        await sourceResponse.arrayBuffer(),
+        sourceResponse.headers.get('content-type') || '',
+        sourceUrl
+      );
+
       const translatedVtt = await translateSubtitle(
-        await sourceResponse.text(),
+        sourceText,
         lang.name,
         apiKey
       );
