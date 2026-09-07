@@ -7,8 +7,8 @@ const UPSTREAMS = [
 ];
 const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 const MAX_TRACKS = Math.max(1, Math.min(12, Number(process.env.MAX_TRACKS || 6)));
-const BATCH_CUES = Math.max(30, Math.min(120, Number(process.env.BATCH_CUES || 70)));
-const GEMINI_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.GEMINI_CONCURRENCY || 3)));
+const BATCH_CUES = Math.max(120, Math.min(500, Number(process.env.BATCH_CUES || 320)));
+const GEMINI_CONCURRENCY = 1;
 
 const LANGS = {
   fr: { name: 'Français', iso3: 'fra' },
@@ -92,8 +92,8 @@ function manifest(langCode) {
   const lang = LANGS[langCode];
   return {
     id: 'com.boomsubs.gemini.' + langCode,
-    version: '1.4.0',
-    name: 'BoomSubs Gemini v1.4 → ' + lang.name,
+    version: '1.5.0',
+    name: 'BoomSubs Gemini v1.5 → ' + lang.name,
     description: 'OpenSubtitles v3 officiel Stremio → Gemini. Aucune clé API OpenSubtitles personnelle.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -319,7 +319,7 @@ async function translateBatch(items, targetName, apiKey) {
 
   let lastError;
 
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 4; attempt++) {
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -337,6 +337,23 @@ async function translateBatch(items, targetName, apiKey) {
           }
         })
       });
+
+      if (response.status === 429) {
+        const retryAfterHeader = Number(response.headers.get('retry-after') || 0);
+        const waitMs = retryAfterHeader > 0
+          ? retryAfterHeader * 1000
+          : Math.min(15000, 2500 * (attempt + 1));
+
+        const details = (await response.text()).slice(0, 500);
+        lastError = new Error('Gemini quota/rate limit: ' + details);
+
+        if (attempt < 3) {
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+          continue;
+        }
+
+        throw lastError;
+      }
 
       if (!response.ok) {
         throw new Error(
@@ -364,8 +381,9 @@ async function translateBatch(items, targetName, apiKey) {
       return items.map((item) => translated.get(item.i) ?? item.text);
     } catch (error) {
       lastError = error;
-      if (attempt === 0) {
-        await new Promise((resolve) => setTimeout(resolve, 700));
+
+      if (attempt < 3 && !String(error?.message || error).includes('quota/rate limit')) {
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
       }
     }
   }
@@ -412,42 +430,21 @@ async function translateSubtitle(sourceText, targetName, apiKey) {
   }
 
   const translated = new Array(cues.length);
-  const jobs = [];
 
   for (let start = 0; start < cues.length; start += BATCH_CUES) {
-    jobs.push({
-      start,
-      items: cues
-        .slice(start, start + BATCH_CUES)
-        .map((cue, offset) => ({
-          i: start + offset,
-          text: cue.text
-        }))
+    const items = cues
+      .slice(start, start + BATCH_CUES)
+      .map((cue, offset) => ({
+        i: start + offset,
+        text: cue.text
+      }));
+
+    const batch = await translateBatch(items, targetName, apiKey);
+
+    batch.forEach((value, offset) => {
+      translated[start + offset] = value;
     });
   }
-
-  let nextJob = 0;
-
-  async function worker() {
-    while (true) {
-      const jobIndex = nextJob++;
-      if (jobIndex >= jobs.length) return;
-
-      const job = jobs[jobIndex];
-      const batch = await translateBatch(job.items, targetName, apiKey);
-
-      batch.forEach((value, offset) => {
-        translated[job.start + offset] = value;
-      });
-    }
-  }
-
-  await Promise.all(
-    Array.from(
-      { length: Math.min(GEMINI_CONCURRENCY, jobs.length) },
-      () => worker()
-    )
-  );
 
   return renderVtt(
     cues.map((cue, index) => ({
@@ -487,7 +484,7 @@ async function fetchJsonWithTimeout(url, timeoutMs = 4500) {
     const response = await fetch(url, {
       signal: controller.signal,
       headers: {
-        'user-agent': 'BoomSubs-Gemini/1.1 (Stremio/Nuvio addon)',
+        'user-agent': 'BoomSubs-Gemini/1.5 (Stremio/Nuvio addon)',
         'accept': 'application/json'
       }
     });
@@ -736,40 +733,16 @@ export async function handleRequest(request) {
         });
       }
 
+      const best =
+        candidates.find((subtitle) => isEnglish(subtitle.lang)) ||
+        candidates[0];
+
+      const encoded = encodeUrl(best.url);
+      const signature = signUrl(best.url, langCode, apiKey);
+
       const subtitles = [
         {
-          id: 'boom-test-visible',
-          url:
-            origin +
-            '/c/' +
-            token +
-            '/' +
-            langCode +
-            '/test.vtt',
-          lang: 'und'
-        },
-        ...(candidates[0] ? [{
-          id: 'boom-original-' + stableId(candidates[0].url),
-          url:
-            origin +
-            '/c/' +
-            token +
-            '/' +
-            langCode +
-            '/source.vtt?u=' +
-            encodeURIComponent(encodeUrl(candidates[0].url)) +
-            '&sig=' +
-            encodeURIComponent(signUrl(candidates[0].url, langCode, apiKey)),
-          lang: isEnglish(candidates[0].lang) ? 'eng' : (candidates[0].lang || 'und')
-        }] : []),
-        ...candidates.map((subtitle, index) => {
-        const encoded = encodeUrl(subtitle.url);
-        const signature = signUrl(subtitle.url, langCode, apiKey);
-
-        return {
-          id: 'boom-gemini-' + stableId(
-            String(subtitle.id || index) + '|' + subtitle.url + '|' + langCode
-          ),
+          id: 'boom-gemini-best-' + stableId(best.url + '|' + langCode),
           url:
             origin +
             '/c/' +
@@ -781,8 +754,21 @@ export async function handleRequest(request) {
             '&sig=' +
             encodeURIComponent(signature),
           lang: lang.iso3
-        };
-      })
+        },
+        {
+          id: 'boom-original-best-' + stableId(best.url),
+          url:
+            origin +
+            '/c/' +
+            token +
+            '/' +
+            langCode +
+            '/source.vtt?u=' +
+            encodeURIComponent(encoded) +
+            '&sig=' +
+            encodeURIComponent(signature),
+          lang: isEnglish(best.lang) ? 'eng' : (best.lang || 'und')
+        }
       ];
 
       return json(200, { subtitles }, {
@@ -833,7 +819,7 @@ export async function handleRequest(request) {
 
     try {
       const sourceResponse = await fetch(sourceUrl, {
-        headers: { 'user-agent': 'BoomSubs-Gemini/1.3' }
+        headers: { 'user-agent': 'BoomSubs-Gemini/1.5' }
       });
 
       if (!sourceResponse.ok) {
@@ -955,7 +941,7 @@ export async function handleRequest(request) {
 
     try {
       const sourceResponse = await fetch(sourceUrl, {
-        headers: { 'user-agent': 'BoomSubs-Gemini/1.0' }
+        headers: { 'user-agent': 'BoomSubs-Gemini/1.5' }
       });
 
       if (!sourceResponse.ok) {
