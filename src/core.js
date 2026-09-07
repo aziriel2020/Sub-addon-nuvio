@@ -88,14 +88,13 @@ function normalizeUrl(urlString, headers) {
   return u;
 }
 
-function manifest(langCode, slot = 1) {
+function manifest(langCode) {
   const lang = LANGS[langCode];
-  const sourceSlot = Math.max(1, Math.min(4, Number(slot) || 1));
   return {
-    id: 'com.boomsubs.gemini.' + langCode + '.source' + sourceSlot,
-    version: '1.6.0',
-    name: 'BoomSubs EN #' + sourceSlot + ' → ' + lang.name,
-    description: 'Choisis la source anglaise #' + sourceSlot + ', puis Gemini la traduit. Aucune clé API OpenSubtitles personnelle.',
+    id: 'com.boomsubs.gemini.selector.' + langCode,
+    version: '1.7.0',
+    name: 'BoomSubs Selector → ' + lang.name,
+    description: 'Un seul addon : 4 sources anglaises originales + 4 traductions Gemini correspondantes. Choisis la même position EN/FR.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
     catalogs: [],
@@ -577,21 +576,23 @@ function configurePage(origin) {
   return '<!doctype html>' +
     '<html lang="fr"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
-    '<title>BoomSubs Gemini</title>' +
-    '<style>body{font-family:system-ui,sans-serif;max-width:820px;margin:40px auto;padding:0 18px;background:#111;color:#eee}.card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:22px;margin:18px 0}.slot{border-top:1px solid #333;padding-top:14px;margin-top:14px}select,input,button{font:inherit;padding:11px;border-radius:9px;border:1px solid #555;background:#151515;color:#fff}input{width:100%;box-sizing:border-box;margin:8px 0}button{cursor:pointer;font-weight:700;margin-right:8px}.warn{color:#ffd27d}.good{color:#9be28f}</style>' +
-    '</head><body><h1>💥 BoomSubs Gemini</h1>' +
-    '<p>Installe jusqu’à 4 sources anglaises. Dans Nuvio, teste EN #1/#2/#3/#4 puis choisis le Français du même numéro.</p>' +
+    '<title>BoomSubs Selector</title>' +
+    '<style>body{font-family:system-ui,sans-serif;max-width:820px;margin:40px auto;padding:0 18px;background:#111;color:#eee}.card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:22px;margin:18px 0}select,input,button{font:inherit;padding:11px;border-radius:9px;border:1px solid #555;background:#151515;color:#fff}input{width:100%;box-sizing:border-box;margin:8px 0}button{cursor:pointer;font-weight:700;margin-right:8px}.warn{color:#ffd27d}.good{color:#9be28f}</style>' +
+    '</head><body><h1>💥 BoomSubs Selector</h1>' +
+    '<p>Un seul addon. Il expose jusqu’à 4 sources anglaises et les 4 traductions françaises correspondantes.</p>' +
     '<div class="card">' +
     '<label>Clé Gemini</label><input id="key" type="password" autocomplete="off" placeholder="Colle ta clé Gemini">' +
     '<label>Langue cible</label><br><select id="lang">' + options + '</select><br><br>' +
-    '<button id="make">Générer les 4 manifests</button>' +
-    '<div id="slots"></div>' +
-    '<p class="warn">Chaque source est un addon séparé dans Nuvio. La traduction Gemini ne démarre que quand tu sélectionnes une piste française.</p>' +
+    '<button id="make">Créer le manifest unique</button><button id="copy">Copier</button>' +
+    '<input id="url" readonly placeholder="Le lien apparaîtra ici">' +
+    '<p class="good">Dans Nuvio : teste les pistes English dans l’ordre. Si la 2e est la bonne, sélectionne ensuite la 2e piste Français.</p>' +
+    '<p class="warn">Gemini n’est appelé que lorsque tu sélectionnes une piste traduite.</p>' +
     '</div>' +
     '<script>' +
-    'const k=document.getElementById("key"),l=document.getElementById("lang"),box=document.getElementById("slots");' +
+    'const k=document.getElementById("key"),l=document.getElementById("lang"),u=document.getElementById("url");' +
     'function token(v){const b=btoa(JSON.stringify({k:v}));return b.replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"")}' +
-    'document.getElementById("make").onclick=()=>{const v=k.value.trim();if(!v){alert("Clé Gemini manquante");return}const t=token(v);box.innerHTML="";for(let i=1;i<=4;i++){const u=location.origin+"/c/"+t+"/"+l.value+"/manifest.json?slot="+i;const d=document.createElement("div");d.className="slot";d.innerHTML="<b class=good>BoomSubs EN #"+i+"</b><input readonly value=\""+u+"\"><button>Copier</button>";const inp=d.querySelector("input");d.querySelector("button").onclick=()=>{inp.select();navigator.clipboard?.writeText(inp.value)};box.appendChild(d)}};' +
+    'document.getElementById("make").onclick=()=>{const v=k.value.trim();if(!v){alert("Clé Gemini manquante");return}u.value=location.origin+"/c/"+token(v)+"/"+l.value+"/manifest.json";u.select()};' +
+    'document.getElementById("copy").onclick=()=>{if(u.value){u.select();navigator.clipboard?.writeText(u.value)}};' +
     '</script></body></html>';
 }
 export async function handleRequest(request) {
@@ -663,8 +664,7 @@ export async function handleRequest(request) {
       return json(400, { error: 'Invalid Gemini configuration' });
     }
 
-    const slot = Math.max(1, Math.min(4, Number(u.searchParams.get('slot') || 1)));
-    return json(200, manifest(langCode, slot), {
+    return json(200, manifest(langCode), {
       'cache-control': 'private, max-age=300'
     });
   }
@@ -735,19 +735,17 @@ export async function handleRequest(request) {
         });
       }
 
-      const slot = Math.max(1, Math.min(4, Number(u.searchParams.get('slot') || 1)));
       const englishCandidates = candidates.filter((subtitle) => isEnglish(subtitle.lang));
-      const sourcePool = englishCandidates.length ? englishCandidates : candidates;
-      const best = sourcePool[slot - 1];
+      const sourcePool = (englishCandidates.length ? englishCandidates : candidates).slice(0, 4);
 
-      if (!best) {
+      if (!sourcePool.length) {
         return json(200, {
           subtitles: [
             diagnosticSubtitle(
               origin,
               token,
               langCode,
-              'BoomSubs EN #' + slot + ': aucune source anglaise disponible'
+              'BoomSubs Selector: aucune source anglaise disponible'
             )
           ]
         }, {
@@ -755,12 +753,36 @@ export async function handleRequest(request) {
         });
       }
 
-      const encoded = encodeUrl(best.url);
-      const signature = signUrl(best.url, langCode, apiKey);
+      const englishTracks = sourcePool.map((source, index) => {
+        const slot = index + 1;
+        const encoded = encodeUrl(source.url);
+        const signature = signUrl(source.url, langCode, apiKey);
 
-      const subtitles = [
-        {
-          id: 'boom-gemini-source-' + slot + '-' + stableId(best.url + '|' + langCode),
+        return {
+          id: 'boom-en-' + slot + '-' + stableId(source.url),
+          url:
+            origin +
+            '/c/' +
+            token +
+            '/' +
+            langCode +
+            '/source.vtt?u=' +
+            encodeURIComponent(encoded) +
+            '&sig=' +
+            encodeURIComponent(signature) +
+            '&slot=' +
+            slot,
+          lang: 'eng'
+        };
+      });
+
+      const translatedTracks = sourcePool.map((source, index) => {
+        const slot = index + 1;
+        const encoded = encodeUrl(source.url);
+        const signature = signUrl(source.url, langCode, apiKey);
+
+        return {
+          id: 'boom-fr-' + slot + '-' + stableId(source.url + '|' + langCode),
           url:
             origin +
             '/c/' +
@@ -774,24 +796,10 @@ export async function handleRequest(request) {
             '&slot=' +
             slot,
           lang: lang.iso3
-        },
-        {
-          id: 'boom-original-source-' + slot + '-' + stableId(best.url),
-          url:
-            origin +
-            '/c/' +
-            token +
-            '/' +
-            langCode +
-            '/source.vtt?u=' +
-            encodeURIComponent(encoded) +
-            '&sig=' +
-            encodeURIComponent(signature) +
-            '&slot=' +
-            slot,
-          lang: isEnglish(best.lang) ? 'eng' : (best.lang || 'und')
-        }
-      ];
+        };
+      });
+
+      const subtitles = [...englishTracks, ...translatedTracks];
 
       return json(200, { subtitles }, {
         'cache-control': 'private, max-age=300'
@@ -857,9 +865,15 @@ export async function handleRequest(request) {
       const cues = parseSubtitle(sourceText);
       if (!cues.length) throw new Error('Original subtitle parser found 0 cues');
 
+      const slot = Math.max(1, Math.min(4, Number(u.searchParams.get('slot') || 1)));
+      const markedCues = cues.map((cue) => ({
+        timing: cue.timing,
+        text: '[EN #' + slot + '] ' + cue.text
+      }));
+
       return text(
         200,
-        renderVtt(cues),
+        renderVtt(markedCues),
         'text/vtt; charset=utf-8',
         { 'cache-control': 'private, max-age=3600' }
       );
