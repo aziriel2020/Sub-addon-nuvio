@@ -92,8 +92,8 @@ function manifest(langCode) {
   const lang = LANGS[langCode];
   return {
     id: 'com.boomsubs.gemini.' + langCode,
-    version: '1.3.1',
-    name: 'BoomSubs Gemini v1.3.1 → ' + lang.name,
+    version: '1.3.2',
+    name: 'BoomSubs Gemini v1.3.2 → ' + lang.name,
     description: 'OpenSubtitles v3 officiel Stremio → Gemini. Aucune clé API OpenSubtitles personnelle.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -267,7 +267,7 @@ function errorVtt(message) {
   return [
     'WEBVTT',
     '',
-    '00:00:00.000 --> 00:00:30.000',
+    '00:00:00.000 --> 10:00:00.000',
     'BoomSubs: ' + safe,
     ''
   ].join('\n');
@@ -873,7 +873,7 @@ export async function handleRequest(request) {
       [
         'WEBVTT',
         '',
-        '00:00:00.000 --> 00:00:45.000',
+        '00:00:00.000 --> 10:00:00.000',
         'BoomSubs TEST OK - le lecteur Nuvio charge bien cette piste',
         ''
       ].join('\n'),
@@ -891,7 +891,7 @@ export async function handleRequest(request) {
     const body = [
       'WEBVTT',
       '',
-      '00:00:00.000 --> 00:00:20.000',
+      '00:00:00.000 --> 10:00:00.000',
       message,
       ''
     ].join('\n');
