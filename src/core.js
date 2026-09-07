@@ -688,7 +688,10 @@ export async function handleRequest(request) {
     }
 
     try {
-      const upstreamPath = subtitleMatch[3] + u.search;
+      const upstreamParams = new URLSearchParams(u.searchParams);
+      upstreamParams.delete('slot');
+      const upstreamQuery = upstreamParams.toString();
+      const upstreamPath = subtitleMatch[3] + (upstreamQuery ? '?' + upstreamQuery : '');
       const requestedIdMatch = subtitleMatch[3].match(/^\/subtitles\/(?:movie|series)\/([^/.]+(?:[:][^/.]+)*)\.json$/);
       const requestedId = requestedIdMatch ? decodeURIComponent(requestedIdMatch[1]) : '';
 
