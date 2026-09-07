@@ -104,13 +104,13 @@ function isEnglish(value) {
   return ENGLISH.has(String(value || '').trim().toLowerCase());
 }
 
-function signingKey() {
-  return process.env.ADDON_SECRET || process.env.GEMINI_API_KEY || 'boomsubs-local-development';
+function signingKey(apiKey) {
+  return process.env.ADDON_SECRET || apiKey || 'boomsubs-local-development';
 }
 
-function signUrl(url, langCode) {
+function signUrl(url, langCode, apiKey) {
   return crypto
-    .createHmac('sha256', signingKey())
+    .createHmac('sha256', signingKey(apiKey))
     .update(langCode + '\n' + url)
     .digest('base64url')
     .slice(0, 32);
@@ -128,6 +128,18 @@ function encodeUrl(url) {
 
 function decodeUrl(value) {
   return Buffer.from(value, 'base64url').toString('utf8');
+}
+
+function decodeConfigToken(token) {
+  const decoded = Buffer.from(token, 'base64url').toString('utf8');
+  const parsed = JSON.parse(decoded);
+  const apiKey = String(parsed?.k || '').trim();
+
+  if (apiKey.length < 20) {
+    throw new Error('Invalid Gemini API key');
+  }
+
+  return apiKey;
 }
 
 function stableId(value) {
@@ -315,7 +327,7 @@ async function fetchUpstreamSubtitles(pathAndQuery) {
   return Array.isArray(data?.subtitles) ? data.subtitles : [];
 }
 
-function configurePage(origin, ready) {
+function configurePage(origin) {
   const options = Object.entries(LANGS)
     .map(([code, lang]) =>
       '<option value="' + code + '"' +
@@ -328,18 +340,23 @@ function configurePage(origin, ready) {
     '<html lang="fr"><head><meta charset="utf-8">' +
     '<meta name="viewport" content="width=device-width,initial-scale=1">' +
     '<title>BoomSubs Gemini</title>' +
-    '<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 18px;background:#111;color:#eee}.card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:22px;margin:18px 0}select,input,button{font:inherit;padding:11px;border-radius:9px;border:1px solid #555;background:#151515;color:#fff}input{width:100%;box-sizing:border-box;margin:10px 0}button{cursor:pointer;font-weight:700}.ok{color:#9be28f}.bad{color:#ff9e9e}code{color:#b8e0ff}</style>' +
+    '<style>body{font-family:system-ui,sans-serif;max-width:760px;margin:40px auto;padding:0 18px;background:#111;color:#eee}.card{background:#1b1b1b;border:1px solid #333;border-radius:14px;padding:22px;margin:18px 0}select,input,button{font:inherit;padding:11px;border-radius:9px;border:1px solid #555;background:#151515;color:#fff}input{width:100%;box-sizing:border-box;margin:10px 0}button{cursor:pointer;font-weight:700;margin-right:8px}.ok{color:#9be28f}.warn{color:#ffd27d}code{color:#b8e0ff;word-break:break-all}</style>' +
     '</head><body><h1>💥 BoomSubs Gemini</h1>' +
     '<p>OpenSubtitles v3 officiel Stremio → Gemini → Nuvio. <b>Aucune API OpenSubtitles personnelle.</b></p>' +
-    '<div class="card"><p>Gemini : <b class="' + (ready ? 'ok' : 'bad') + '">' +
-    (ready ? 'clé configurée ✓' : 'GEMINI_API_KEY manquante') +
-    '</b></p><label>Langue cible</label><br><select id="lang">' +
-    options +
-    '</select><button id="make">Créer le lien</button>' +
-    '<input id="url" readonly value="' + origin + '/fr/manifest.json">' +
-    '<p>Colle ce manifest dans Nuvio → Addons.</p></div>' +
-    '<script>const l=document.getElementById("lang"),u=document.getElementById("url");document.getElementById("make").onclick=()=>{u.value=location.origin+"/"+l.value+"/manifest.json";u.select();navigator.clipboard?.writeText(u.value)};</script>' +
-    '</body></html>';
+    '<div class="card">' +
+    '<label>Clé Gemini</label>' +
+    '<input id="key" type="password" autocomplete="off" placeholder="Colle ta clé Gemini">' +
+    '<label>Langue cible</label><br><select id="lang">' + options + '</select><br><br>' +
+    '<button id="make">Créer le manifest</button><button id="copy" type="button">Copier</button>' +
+    '<input id="url" readonly placeholder="Le lien manifest apparaîtra ici">' +
+    '<p class="warn">La clé n’est pas enregistrée dans GitHub ni dans une variable Vercel. Elle est encodée dans ton URL d’addon, donc garde ce lien privé.</p>' +
+    '<p>Colle ensuite le lien dans Nuvio → Addons.</p></div>' +
+    '<script>' +
+    'const k=document.getElementById("key"),l=document.getElementById("lang"),u=document.getElementById("url");' +
+    'function token(v){const b=btoa(JSON.stringify({k:v}));return b.replace(/\\+/g,"-").replace(/\\//g,"_").replace(/=+$/,"")}' +
+    'document.getElementById("make").onclick=()=>{const v=k.value.trim();if(!v){alert("Clé Gemini manquante");return}u.value=location.origin+"/c/"+token(v)+"/"+l.value+"/manifest.json";u.select()};' +
+    'document.getElementById("copy").onclick=()=>{if(u.value)navigator.clipboard?.writeText(u.value)};' +
+    '</script></body></html>';
 }
 
 export async function handleRequest(request) {
@@ -360,48 +377,59 @@ export async function handleRequest(request) {
   }
 
   if (u.pathname === '/' || u.pathname === '/configure') {
-    return text(
-      200,
-      configurePage(origin, Boolean(process.env.GEMINI_API_KEY)),
-      'text/html; charset=utf-8'
-    );
+    return text(200, configurePage(origin), 'text/html; charset=utf-8');
   }
 
   if (u.pathname === '/health') {
     return json(200, {
       ok: true,
-      geminiConfigured: Boolean(process.env.GEMINI_API_KEY),
+      configurationMode: 'manifest-url',
       upstream: UPSTREAM,
       model: MODEL
     });
   }
 
-  const manifestMatch = u.pathname.match(/^\/([a-z]{2})\/manifest\.json$/);
+  const manifestMatch = u.pathname.match(/^\/c\/([^/]+)\/([a-z]{2})\/manifest\.json$/);
 
   if (manifestMatch) {
-    const langCode = manifestMatch[1];
+    const token = manifestMatch[1];
+    const langCode = manifestMatch[2];
 
     if (!LANGS[langCode]) {
       return json(404, { error: 'Unsupported target language' });
     }
 
+    try {
+      decodeConfigToken(token);
+    } catch {
+      return json(400, { error: 'Invalid Gemini configuration' });
+    }
+
     return json(200, manifest(langCode), {
-      'cache-control': 'public, max-age=3600'
+      'cache-control': 'private, max-age=300'
     });
   }
 
   const subtitleMatch = u.pathname.match(
-    /^\/([a-z]{2})(\/subtitles\/(movie|series)\/.+\.json)$/
+    /^\/c\/([^/]+)\/([a-z]{2})(\/subtitles\/(movie|series)\/.+\.json)$/
   );
 
   if (subtitleMatch) {
-    const langCode = subtitleMatch[1];
+    const token = subtitleMatch[1];
+    const langCode = subtitleMatch[2];
     const lang = LANGS[langCode];
 
     if (!lang) return json(404, { subtitles: [] });
 
+    let apiKey;
     try {
-      const upstreamPath = subtitleMatch[2] + u.search;
+      apiKey = decodeConfigToken(token);
+    } catch {
+      return json(400, { subtitles: [], error: 'Invalid Gemini configuration' });
+    }
+
+    try {
+      const upstreamPath = subtitleMatch[3] + u.search;
       const upstream = await fetchUpstreamSubtitles(upstreamPath);
 
       const english = upstream
@@ -410,7 +438,7 @@ export async function handleRequest(request) {
 
       const subtitles = english.map((subtitle, index) => {
         const encoded = encodeUrl(subtitle.url);
-        const signature = signUrl(subtitle.url, langCode);
+        const signature = signUrl(subtitle.url, langCode, apiKey);
 
         return {
           id: 'boom-gemini-' + stableId(
@@ -418,6 +446,8 @@ export async function handleRequest(request) {
           ),
           url:
             origin +
+            '/c/' +
+            token +
             '/' +
             langCode +
             '/translate.vtt?u=' +
@@ -429,7 +459,7 @@ export async function handleRequest(request) {
       });
 
       return json(200, { subtitles }, {
-        'cache-control': 'public, max-age=300'
+        'cache-control': 'private, max-age=300'
       });
     } catch (error) {
       return json(502, {
@@ -440,14 +470,22 @@ export async function handleRequest(request) {
   }
 
   const translateMatch = u.pathname.match(
-    /^\/([a-z]{2})\/translate\.vtt$/
+    /^\/c\/([^/]+)\/([a-z]{2})\/translate\.vtt$/
   );
 
   if (translateMatch) {
-    const langCode = translateMatch[1];
+    const token = translateMatch[1];
+    const langCode = translateMatch[2];
     const lang = LANGS[langCode];
 
     if (!lang) return text(404, 'Unsupported target language');
+
+    let apiKey;
+    try {
+      apiKey = decodeConfigToken(token);
+    } catch {
+      return text(400, 'Invalid Gemini configuration');
+    }
 
     const encoded = u.searchParams.get('u');
     const signature = u.searchParams.get('sig');
@@ -457,7 +495,6 @@ export async function handleRequest(request) {
     }
 
     let sourceUrl;
-
     try {
       sourceUrl = decodeUrl(encoded);
     } catch {
@@ -466,33 +503,25 @@ export async function handleRequest(request) {
 
     if (
       !/^https?:\/\//i.test(sourceUrl) ||
-      !safeEqual(signUrl(sourceUrl, langCode), signature)
+      !safeEqual(signUrl(sourceUrl, langCode, apiKey), signature)
     ) {
       return text(403, 'Invalid subtitle signature');
     }
 
-    const apiKey = process.env.GEMINI_API_KEY;
-
-    if (!apiKey) {
-      return text(503, 'GEMINI_API_KEY is not configured');
-    }
-
-    const cacheKey = langCode + '|' + sourceUrl;
+    const cacheKey = langCode + '|' + sourceUrl + '|' + stableId(apiKey);
 
     if (cache.has(cacheKey)) {
       return text(
         200,
         cache.get(cacheKey),
         'text/vtt; charset=utf-8',
-        { 'cache-control': 'public, max-age=604800' }
+        { 'cache-control': 'private, max-age=604800' }
       );
     }
 
     try {
       const sourceResponse = await fetch(sourceUrl, {
-        headers: {
-          'user-agent': 'BoomSubs-Gemini/1.0'
-        }
+        headers: { 'user-agent': 'BoomSubs-Gemini/1.0' }
       });
 
       if (!sourceResponse.ok) {
@@ -506,16 +535,13 @@ export async function handleRequest(request) {
       );
 
       cache.set(cacheKey, translatedVtt);
-
-      if (cache.size > 80) {
-        cache.delete(cache.keys().next().value);
-      }
+      if (cache.size > 80) cache.delete(cache.keys().next().value);
 
       return text(
         200,
         translatedVtt,
         'text/vtt; charset=utf-8',
-        { 'cache-control': 'public, max-age=604800' }
+        { 'cache-control': 'private, max-age=604800' }
       );
     } catch (error) {
       return text(
@@ -527,3 +553,4 @@ export async function handleRequest(request) {
 
   return json(404, { error: 'Not found' });
 }
+
