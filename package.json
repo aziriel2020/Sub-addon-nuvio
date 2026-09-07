@@ -1,0 +1,9 @@
+{
+  "name": "sub-addon-nuvio",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Nuvio/Stremio subtitle addon using official OpenSubtitles v3 addon as upstream and Gemini for translation.",
+  "scripts": {"start": "node server.js", "test": "node --test"},
+  "engines": {"node": ">=20"}
+}
