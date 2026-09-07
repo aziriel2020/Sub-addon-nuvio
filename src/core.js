@@ -91,12 +91,11 @@ function manifest(langCode) {
   const lang = LANGS[langCode];
   return {
     id: 'com.boomsubs.gemini.' + langCode,
-    version: '1.1.0',
-    name: 'BoomSubs Gemini FIX → ' + lang.name,
+    version: '1.2.0',
+    name: 'BoomSubs Gemini v1.2 → ' + lang.name,
     description: 'OpenSubtitles v3 officiel Stremio → Gemini. Aucune clé API OpenSubtitles personnelle.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
-    idPrefixes: ['tt'],
     catalogs: [],
     behaviorHints: {
       configurable: false,
@@ -165,6 +164,21 @@ function decodeConfigToken(token) {
 
 function stableId(value) {
   return crypto.createHash('sha1').update(value).digest('hex').slice(0, 16);
+}
+
+function diagnosticSubtitle(origin, token, langCode, message) {
+  return {
+    id: 'boom-diagnostic-' + stableId(message),
+    url:
+      origin +
+      '/c/' +
+      token +
+      '/' +
+      langCode +
+      '/diagnostic.vtt?m=' +
+      encodeURIComponent(message),
+    lang: LANGS[langCode]?.iso3 || 'fra'
+  };
 }
 
 function assTimeToVtt(value) {
@@ -641,11 +655,48 @@ export async function handleRequest(request) {
 
     try {
       const upstreamPath = subtitleMatch[3] + u.search;
+      const requestedIdMatch = subtitleMatch[3].match(/^\/subtitles\/(?:movie|series)\/([^/.]+(?:[:][^/.]+)*)\.json$/);
+      const requestedId = requestedIdMatch ? decodeURIComponent(requestedIdMatch[1]) : '';
+
+      if (requestedId && !requestedId.startsWith('tt')) {
+        return json(200, {
+          subtitles: [
+            diagnosticSubtitle(
+              origin,
+              token,
+              langCode,
+              'BoomSubs appelé, mais ID non-IMDb reçu: ' + requestedId
+            )
+          ]
+        }, {
+          'cache-control': 'no-store'
+        });
+      }
+
       const upstreamResult = await fetchUpstreamSubtitles(upstreamPath);
 
       const candidates = upstreamResult.subtitles
         .filter((subtitle) => subtitle?.url)
         .slice(0, MAX_TRACKS);
+
+      if (!candidates.length) {
+        const statuses = upstreamResult.diagnostics
+          .map((item) => item.upstream + '=' + item.status + '/' + item.count)
+          .join(', ');
+
+        return json(200, {
+          subtitles: [
+            diagnosticSubtitle(
+              origin,
+              token,
+              langCode,
+              'BoomSubs: aucune piste OpenSubtitles pour ' + (requestedId || 'ID inconnu') + ' (' + statuses + ')'
+            )
+          ]
+        }, {
+          'cache-control': 'no-store'
+        });
+      }
 
       const subtitles = candidates.map((subtitle, index) => {
         const encoded = encodeUrl(subtitle.url);
@@ -678,6 +729,25 @@ export async function handleRequest(request) {
         error: String(error?.message || error)
       });
     }
+  }
+
+  const diagnosticMatch = u.pathname.match(
+    /^\/c\/([^/]+)\/([a-z]{2})\/diagnostic\.vtt$/
+  );
+
+  if (diagnosticMatch) {
+    const message = u.searchParams.get('m') || 'BoomSubs diagnostic';
+    const body = [
+      'WEBVTT',
+      '',
+      '00:00:00.000 --> 00:00:20.000',
+      message,
+      ''
+    ].join('\n');
+
+    return text(200, body, 'text/vtt; charset=utf-8', {
+      'cache-control': 'no-store'
+    });
   }
 
   const translateMatch = u.pathname.match(
