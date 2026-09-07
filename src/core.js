@@ -5,7 +5,7 @@ const UPSTREAMS = [
   { name: 'OpenSubtitles v3', base: 'https://opensubtitles-v3.strem.io' },
   { name: 'OpenSubtitles legacy', base: 'https://opensubtitles.strem.io/stremio/v1' }
 ];
-const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
+const MODEL = process.env.GEMINI_MODEL || 'gemini-3.5-flash-lite';
 const MAX_TRACKS = Math.max(1, Math.min(12, Number(process.env.MAX_TRACKS || 6)));
 const BATCH_CUES = Math.max(30, Math.min(120, Number(process.env.BATCH_CUES || 70)));
 const GEMINI_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.GEMINI_CONCURRENCY || 3)));
@@ -92,8 +92,8 @@ function manifest(langCode) {
   const lang = LANGS[langCode];
   return {
     id: 'com.boomsubs.gemini.' + langCode,
-    version: '1.3.2',
-    name: 'BoomSubs Gemini v1.3.2 → ' + lang.name,
+    version: '1.4.0',
+    name: 'BoomSubs Gemini v1.4 → ' + lang.name,
     description: 'OpenSubtitles v3 officiel Stremio → Gemini. Aucune clé API OpenSubtitles personnelle.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -330,8 +330,10 @@ async function translateBatch(items, targetName, apiKey) {
         body: JSON.stringify({
           contents: [{ parts: [{ text: prompt }] }],
           generationConfig: {
-            temperature: 0,
-            responseMimeType: 'application/json'
+            responseMimeType: 'application/json',
+            thinkingConfig: {
+              thinkingLevel: 'minimal'
+            }
           }
         })
       });
