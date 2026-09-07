@@ -1,6 +1,9 @@
 import crypto from 'node:crypto';
 
-const UPSTREAM = 'https://opensubtitles-v3.strem.io';
+const UPSTREAMS = [
+  { name: 'OpenSubtitles v3', base: 'https://opensubtitles-v3.strem.io' },
+  { name: 'OpenSubtitles legacy', base: 'https://opensubtitles.strem.io/stremio/v1' }
+];
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const MAX_TRACKS = Math.max(1, Math.min(12, Number(process.env.MAX_TRACKS || 6)));
 const BATCH_CUES = Math.max(20, Math.min(500, Number(process.env.BATCH_CUES || 220)));
@@ -28,7 +31,8 @@ const LANGS = {
   fi: { name: 'Suomi', iso3: 'fin' }
 };
 
-const ENGLISH = new Set(['en', 'eng', 'english', 'en-us', 'en-gb']);
+const ENGLISH = new Set(['en', 'eng', 'english', 'en-us', 'en-gb', 'en_us', 'en_gb']);
+const FRENCH = new Set(['fr', 'fra', 'fre', 'french', 'fr-fr', 'fr_fr']);
 const cache = new Map();
 
 function json(status, value, extraHeaders) {
@@ -100,8 +104,24 @@ function manifest(langCode) {
   };
 }
 
+function normalizedLanguage(value) {
+  return String(value || '').trim().toLowerCase();
+}
+
 function isEnglish(value) {
-  return ENGLISH.has(String(value || '').trim().toLowerCase());
+  const lang = normalizedLanguage(value);
+  return ENGLISH.has(lang) || lang.startsWith('en-') || lang.startsWith('eng');
+}
+
+function isFrench(value) {
+  const lang = normalizedLanguage(value);
+  return FRENCH.has(lang) || lang.startsWith('fr-') || lang.startsWith('fra');
+}
+
+function subtitlePriority(subtitle) {
+  if (isEnglish(subtitle?.lang)) return 0;
+  if (isFrench(subtitle?.lang)) return 1;
+  return 2;
 }
 
 function signingKey(apiKey) {
@@ -312,19 +332,114 @@ async function translateSubtitle(sourceText, targetName, apiKey) {
   );
 }
 
-async function fetchUpstreamSubtitles(pathAndQuery) {
-  const response = await fetch(UPSTREAM + pathAndQuery, {
-    headers: {
-      'user-agent': 'BoomSubs-Gemini/1.0 (Stremio/Nuvio addon)'
-    }
-  });
+function upstreamCandidatePaths(pathAndQuery) {
+  const qIndex = pathAndQuery.indexOf('?');
+  const path = qIndex >= 0 ? pathAndQuery.slice(0, qIndex) : pathAndQuery;
+  const query = qIndex >= 0 ? pathAndQuery.slice(qIndex) : '';
+  const candidates = [path + query];
 
-  if (!response.ok) {
-    throw new Error('OpenSubtitles v3 upstream returned ' + response.status);
+  const match = path.match(/^\/subtitles\/(movie|series)\/([^/]+)(?:\/(.+))?\.json$/);
+  if (match) {
+    const type = match[1];
+    const id = match[2];
+    const extra = match[3];
+
+    if (!extra) {
+      candidates.push('/subtitles/' + type + '/' + id + '/*.json' + query);
+    } else {
+      candidates.push('/subtitles/' + type + '/' + id + '.json' + query);
+    }
   }
 
-  const data = await response.json();
-  return Array.isArray(data?.subtitles) ? data.subtitles : [];
+  return [...new Set(candidates)];
+}
+
+async function fetchJsonWithTimeout(url, timeoutMs = 4500) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        'user-agent': 'BoomSubs-Gemini/1.1 (Stremio/Nuvio addon)',
+        'accept': 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      return { ok: false, status: response.status, subtitles: [] };
+    }
+
+    const data = await response.json();
+    return {
+      ok: true,
+      status: response.status,
+      subtitles: Array.isArray(data?.subtitles) ? data.subtitles : []
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 0,
+      error: String(error?.message || error),
+      subtitles: []
+    };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchUpstreamSubtitles(pathAndQuery) {
+  const paths = upstreamCandidatePaths(pathAndQuery);
+  const requests = [];
+
+  for (const upstream of UPSTREAMS) {
+    for (const candidatePath of paths) {
+      requests.push({
+        upstream: upstream.name,
+        url: upstream.base + candidatePath
+      });
+    }
+  }
+
+  const results = await Promise.all(
+    requests.map(async (request) => ({
+      ...request,
+      ...(await fetchJsonWithTimeout(request.url))
+    }))
+  );
+
+  const unique = new Map();
+
+  for (const result of results) {
+    for (const subtitle of result.subtitles || []) {
+      if (!subtitle?.url) continue;
+      const key = subtitle.url;
+      if (!unique.has(key)) {
+        unique.set(key, {
+          ...subtitle,
+          _boomSource: result.upstream
+        });
+      }
+    }
+  }
+
+  const subtitles = [...unique.values()].sort((a, b) => {
+    const pa = subtitlePriority(a);
+    const pb = subtitlePriority(b);
+    return pa - pb;
+  });
+
+  return {
+    subtitles,
+    diagnostics: results.map((result) => ({
+      upstream: result.upstream,
+      status: result.status,
+      count: result.subtitles?.length || 0,
+      url: result.url,
+      error: result.error || null
+    }))
+  };
 }
 
 function configurePage(origin) {
@@ -384,8 +499,31 @@ export async function handleRequest(request) {
     return json(200, {
       ok: true,
       configurationMode: 'manifest-url',
-      upstream: UPSTREAM,
+      upstreams: UPSTREAMS.map((item) => item.base),
       model: MODEL
+    });
+  }
+
+  const debugMatch = u.pathname.match(/^\/debug\/(movie|series)\/([^/]+)\.json$/);
+
+  if (debugMatch) {
+    const type = debugMatch[1];
+    const id = decodeURIComponent(debugMatch[2]);
+    const result = await fetchUpstreamSubtitles('/subtitles/' + type + '/' + id + '.json');
+    return json(200, {
+      id,
+      type,
+      total: result.subtitles.length,
+      languages: [...new Set(result.subtitles.map((subtitle) => subtitle?.lang).filter(Boolean))],
+      sample: result.subtitles.slice(0, 8).map((subtitle) => ({
+        lang: subtitle.lang,
+        id: subtitle.id || null,
+        source: subtitle._boomSource || null,
+        url: subtitle.url
+      })),
+      diagnostics: result.diagnostics
+    }, {
+      'cache-control': 'no-store'
     });
   }
 
@@ -430,13 +568,13 @@ export async function handleRequest(request) {
 
     try {
       const upstreamPath = subtitleMatch[3] + u.search;
-      const upstream = await fetchUpstreamSubtitles(upstreamPath);
+      const upstreamResult = await fetchUpstreamSubtitles(upstreamPath);
 
-      const english = upstream
-        .filter((subtitle) => subtitle?.url && isEnglish(subtitle?.lang))
+      const candidates = upstreamResult.subtitles
+        .filter((subtitle) => subtitle?.url)
         .slice(0, MAX_TRACKS);
 
-      const subtitles = english.map((subtitle, index) => {
+      const subtitles = candidates.map((subtitle, index) => {
         const encoded = encodeUrl(subtitle.url);
         const signature = signUrl(subtitle.url, langCode, apiKey);
 
