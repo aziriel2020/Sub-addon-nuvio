@@ -7,7 +7,8 @@ const UPSTREAMS = [
 ];
 const MODEL = process.env.GEMINI_MODEL || 'gemini-2.5-flash-lite';
 const MAX_TRACKS = Math.max(1, Math.min(12, Number(process.env.MAX_TRACKS || 6)));
-const BATCH_CUES = Math.max(20, Math.min(500, Number(process.env.BATCH_CUES || 220)));
+const BATCH_CUES = Math.max(30, Math.min(120, Number(process.env.BATCH_CUES || 70)));
+const GEMINI_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.GEMINI_CONCURRENCY || 3)));
 
 const LANGS = {
   fr: { name: 'Français', iso3: 'fra' },
@@ -91,8 +92,8 @@ function manifest(langCode) {
   const lang = LANGS[langCode];
   return {
     id: 'com.boomsubs.gemini.' + langCode,
-    version: '1.2.0',
-    name: 'BoomSubs Gemini v1.2 → ' + lang.name,
+    version: '1.3.0',
+    name: 'BoomSubs Gemini v1.3 → ' + lang.name,
     description: 'OpenSubtitles v3 officiel Stremio → Gemini. Aucune clé API OpenSubtitles personnelle.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -258,6 +259,20 @@ export function renderVtt(cues) {
   return output.join('\n');
 }
 
+function errorVtt(message) {
+  const safe = String(message || 'BoomSubs error')
+    .replace(/\r?\n/g, ' ')
+    .slice(0, 900);
+
+  return [
+    'WEBVTT',
+    '',
+    '00:00:00.000 --> 00:00:30.000',
+    'BoomSubs: ' + safe,
+    ''
+  ].join('\n');
+}
+
 function extractGeminiText(data) {
   return (data?.candidates?.[0]?.content?.parts || [])
     .map((part) => part?.text || '')
@@ -395,21 +410,42 @@ async function translateSubtitle(sourceText, targetName, apiKey) {
   }
 
   const translated = new Array(cues.length);
+  const jobs = [];
 
   for (let start = 0; start < cues.length; start += BATCH_CUES) {
-    const items = cues
-      .slice(start, start + BATCH_CUES)
-      .map((cue, offset) => ({
-        i: start + offset,
-        text: cue.text
-      }));
-
-    const batch = await translateBatch(items, targetName, apiKey);
-
-    batch.forEach((value, offset) => {
-      translated[start + offset] = value;
+    jobs.push({
+      start,
+      items: cues
+        .slice(start, start + BATCH_CUES)
+        .map((cue, offset) => ({
+          i: start + offset,
+          text: cue.text
+        }))
     });
   }
+
+  let nextJob = 0;
+
+  async function worker() {
+    while (true) {
+      const jobIndex = nextJob++;
+      if (jobIndex >= jobs.length) return;
+
+      const job = jobs[jobIndex];
+      const batch = await translateBatch(job.items, targetName, apiKey);
+
+      batch.forEach((value, offset) => {
+        translated[job.start + offset] = value;
+      });
+    }
+  }
+
+  await Promise.all(
+    Array.from(
+      { length: Math.min(GEMINI_CONCURRENCY, jobs.length) },
+      () => worker()
+    )
+  );
 
   return renderVtt(
     cues.map((cue, index) => ({
@@ -698,7 +734,19 @@ export async function handleRequest(request) {
         });
       }
 
-      const subtitles = candidates.map((subtitle, index) => {
+      const subtitles = [
+        {
+          id: 'boom-test-visible',
+          url:
+            origin +
+            '/c/' +
+            token +
+            '/' +
+            langCode +
+            '/test.vtt',
+          lang: lang.iso3
+        },
+        ...candidates.map((subtitle, index) => {
         const encoded = encodeUrl(subtitle.url);
         const signature = signUrl(subtitle.url, langCode, apiKey);
 
@@ -718,7 +766,8 @@ export async function handleRequest(request) {
             encodeURIComponent(signature),
           lang: lang.iso3
         };
-      });
+      })
+      ];
 
       return json(200, { subtitles }, {
         'cache-control': 'private, max-age=300'
@@ -729,6 +778,25 @@ export async function handleRequest(request) {
         error: String(error?.message || error)
       });
     }
+  }
+
+  const testMatch = u.pathname.match(
+    /^\/c\/([^/]+)\/([a-z]{2})\/test\.vtt$/
+  );
+
+  if (testMatch) {
+    return text(
+      200,
+      [
+        'WEBVTT',
+        '',
+        '00:00:00.000 --> 00:00:45.000',
+        'BoomSubs TEST OK - le lecteur Nuvio charge bien cette piste',
+        ''
+      ].join('\n'),
+      'text/vtt; charset=utf-8',
+      { 'cache-control': 'no-store' }
+    );
   }
 
   const diagnosticMatch = u.pathname.match(
@@ -832,8 +900,10 @@ export async function handleRequest(request) {
       );
     } catch (error) {
       return text(
-        502,
-        'Subtitle translation failed: ' + String(error?.message || error)
+        200,
+        errorVtt(String(error?.message || error)),
+        'text/vtt; charset=utf-8',
+        { 'cache-control': 'no-store' }
       );
     }
   }
