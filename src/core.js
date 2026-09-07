@@ -91,8 +91,8 @@ function manifest(langCode) {
   const lang = LANGS[langCode];
   return {
     id: 'com.boomsubs.gemini.' + langCode,
-    version: '1.0.0',
-    name: 'BoomSubs Gemini → ' + lang.name,
+    version: '1.1.0',
+    name: 'BoomSubs Gemini FIX → ' + lang.name,
     description: 'OpenSubtitles v3 officiel Stremio → Gemini. Aucune clé API OpenSubtitles personnelle.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
