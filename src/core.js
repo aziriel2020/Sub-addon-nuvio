@@ -92,8 +92,8 @@ function manifest(langCode) {
   const lang = LANGS[langCode];
   return {
     id: 'com.boomsubs.gemini.' + langCode,
-    version: '1.3.0',
-    name: 'BoomSubs Gemini v1.3 → ' + lang.name,
+    version: '1.3.1',
+    name: 'BoomSubs Gemini v1.3.1 → ' + lang.name,
     description: 'OpenSubtitles v3 officiel Stremio → Gemini. Aucune clé API OpenSubtitles personnelle.',
     resources: ['subtitles'],
     types: ['movie', 'series'],
@@ -744,8 +744,22 @@ export async function handleRequest(request) {
             '/' +
             langCode +
             '/test.vtt',
-          lang: lang.iso3
+          lang: 'und'
         },
+        ...(candidates[0] ? [{
+          id: 'boom-original-' + stableId(candidates[0].url),
+          url:
+            origin +
+            '/c/' +
+            token +
+            '/' +
+            langCode +
+            '/source.vtt?u=' +
+            encodeURIComponent(encodeUrl(candidates[0].url)) +
+            '&sig=' +
+            encodeURIComponent(signUrl(candidates[0].url, langCode, apiKey)),
+          lang: isEnglish(candidates[0].lang) ? 'eng' : (candidates[0].lang || 'und')
+        }] : []),
         ...candidates.map((subtitle, index) => {
         const encoded = encodeUrl(subtitle.url);
         const signature = signUrl(subtitle.url, langCode, apiKey);
@@ -777,6 +791,75 @@ export async function handleRequest(request) {
         subtitles: [],
         error: String(error?.message || error)
       });
+    }
+  }
+
+  const sourceMatch = u.pathname.match(
+    /^\/c\/([^/]+)\/([a-z]{2})\/source\.vtt$/
+  );
+
+  if (sourceMatch) {
+    const token = sourceMatch[1];
+    const langCode = sourceMatch[2];
+
+    let apiKey;
+    try {
+      apiKey = decodeConfigToken(token);
+    } catch {
+      return text(200, errorVtt('Invalid Gemini configuration'), 'text/vtt; charset=utf-8');
+    }
+
+    const encoded = u.searchParams.get('u');
+    const signature = u.searchParams.get('sig');
+    if (!encoded || !signature) {
+      return text(200, errorVtt('Missing source subtitle token'), 'text/vtt; charset=utf-8');
+    }
+
+    let sourceUrl;
+    try {
+      sourceUrl = decodeUrl(encoded);
+    } catch {
+      return text(200, errorVtt('Invalid source subtitle token'), 'text/vtt; charset=utf-8');
+    }
+
+    if (
+      !/^https?:\/\//i.test(sourceUrl) ||
+      !safeEqual(signUrl(sourceUrl, langCode, apiKey), signature)
+    ) {
+      return text(200, errorVtt('Invalid source subtitle signature'), 'text/vtt; charset=utf-8');
+    }
+
+    try {
+      const sourceResponse = await fetch(sourceUrl, {
+        headers: { 'user-agent': 'BoomSubs-Gemini/1.3' }
+      });
+
+      if (!sourceResponse.ok) {
+        throw new Error('Original subtitle download returned ' + sourceResponse.status);
+      }
+
+      const sourceText = decodeSubtitleBytes(
+        await sourceResponse.arrayBuffer(),
+        sourceResponse.headers.get('content-type') || '',
+        sourceUrl
+      );
+
+      const cues = parseSubtitle(sourceText);
+      if (!cues.length) throw new Error('Original subtitle parser found 0 cues');
+
+      return text(
+        200,
+        renderVtt(cues),
+        'text/vtt; charset=utf-8',
+        { 'cache-control': 'private, max-age=3600' }
+      );
+    } catch (error) {
+      return text(
+        200,
+        errorVtt(String(error?.message || error)),
+        'text/vtt; charset=utf-8',
+        { 'cache-control': 'no-store' }
+      );
     }
   }
 
